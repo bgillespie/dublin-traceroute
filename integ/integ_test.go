@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/build"
 	"io/ioutil"
@@ -12,21 +12,19 @@ import (
 	"os/exec"
 	"path"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/insomniacslk/dublin-traceroute/go/dublintraceroute/results"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // WARNING: this test is meant to run on CI, don't run it on your production
 // machines or it will mess up your iptables rules.
 
 const NfQueueNum int64 = 101
-
-var (
-	one = 1
-)
 
 var (
 	// TODO detect this at start-up
@@ -79,14 +77,98 @@ type testConfig struct {
 	target  string
 }
 
+// sudoKill sends a signal to the given PID, as root. This is useful when
+// sending signals to a process started under a different user.
+func sudoKill(pid int, sigNum os.Signal, killSession bool) error {
+	if pid == 0 {
+		log.Printf("sudoKill: pid is 0, nothing to do")
+		return nil
+	}
+	if pid <= 0 {
+		// nothing to do: if 0, the Process object is not initialized. If
+		// -1, it has been already killed
+		log.Printf("sudoKill: proc has already been killed, nothing to do")
+		return nil
+	}
+	pidToKill := pid
+	if killSession {
+		sid, err := unix.Getsid(pid)
+		if err != nil {
+			return fmt.Errorf("sudoKill: getsid for pid %d failed: %v", pid, err)
+		}
+		pidToKill = sid
+	}
+	pidStr := strconv.FormatInt(int64(pidToKill), 10)
+	sigStr := strconv.FormatInt(int64(sigNum.(syscall.Signal)), 10)
+	// dragons ahead! Here we assume that we are going to kill the right
+	// process, and that the PID has not been reused.
+	cmd := exec.Command("sudo", "kill", "-"+sigStr, pidStr)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	log.Printf("Sending signal %s to PID %s", sigStr, pidStr)
+	return cmd.Run()
+}
+
+type routest struct {
+	path string
+	proc *os.Process
+}
+
+// Start starts routest in background.
+func (r *routest) Start(asRoot bool, args ...string) error {
+	argv := append([]string{r.path}, args...)
+	attr := os.ProcAttr{
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		Sys: &syscall.SysProcAttr{
+			Foreground: false,
+			Setsid:     true,
+		},
+	}
+	if asRoot {
+		sudo, err := exec.LookPath("sudo")
+		if err != nil {
+			return errors.New("cannot find sudo in PATH")
+		}
+		argv = append([]string{sudo, "-b"}, argv...)
+	}
+	log.Printf("Running routest as %v", argv)
+	child, err := os.StartProcess(argv[0], argv, &attr)
+	if err != nil {
+		return err
+	}
+	r.proc = child
+	return nil
+}
+
+func (r *routest) Wait() error {
+	if r.proc == nil {
+		return errors.New("routest was not started")
+	}
+	pState, err := r.proc.Wait()
+	if err != nil {
+		return err
+	}
+	if pState.ExitCode() != 0 {
+		return fmt.Errorf("routest failed with code %d", pState.ExitCode())
+	}
+	return nil
+}
+
+// Kill terminates routest and any of its child processes.
+func (r *routest) Kill(asRoot bool) error {
+	if r.proc == nil {
+		return errors.New("routest was not started")
+	}
+	if !asRoot {
+		return r.proc.Kill()
+	}
+	return sudoKill(r.proc.Pid, os.Kill, true)
+}
+
 func runWithConfig(cfg testConfig) ([]byte, []byte, error) {
 	// validate to config
 	if cfg.timeout <= 0 {
 		cfg.timeout = defaultDubTrTimeout
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// run routest
 	riCmd := exec.Command("go", "install", "github.com/insomniacslk/dublin-traceroute/go/dublintraceroute/cmd/routest")
@@ -98,21 +180,44 @@ func runWithConfig(cfg testConfig) ([]byte, []byte, error) {
 	if gopath == "" {
 		gopath = build.Default.GOPATH
 	}
-	cl := []string{path.Join(gopath, "bin/routest"), "-i", "lo", "-c", cfg.configFile, "-q", strconv.FormatInt(NfQueueNum, 10)}
-	if needSudo {
-		cl = append([]string{"sudo"}, cl...)
+	/*
+		cl := []string{path.Join(gopath, "bin/routest"), "-i", "lo", "-c", cfg.configFile, "-q", strconv.FormatInt(NfQueueNum, 10)}
+		if needSudo {
+			cl = append([]string{"sudo"}, cl...)
+		}
+		rCmd := exec.Command(cl[0], cl[1:]...)
+		rCmd.Stdout, rCmd.Stderr = os.Stdout, os.Stderr
+		defer func() {
+			// we cannot kill processes started under a different user, so neither
+			// CommandContext nor rCmd.Process.Kill() will work. Literally need to
+			// exec "sudo kill <PID>"
+			log.Printf("Sending kill signal to routest")
+			if err := sudoKill(rCmd.Process.Pid, os.Kill, true); err != nil {
+				log.Panicf("Failed to kill routest process with PID %d: %v", rCmd.Process.Pid, err)
+			}
+		}()
+		// using Start instead of Run so the new process is a session leader and its
+		// process tree can be terminated easily later on.
+		if err := rCmd.Start(); err != nil {
+			// don't panic if routests is killed, it's probably us
+			if !strings.Contains(err.Error(), "signal: killed") {
+				log.Panicf("Error returned from command %+v: %v", rCmd, err)
+			}
+		}
+	*/
+	routest := routest{
+		path: path.Join(gopath, "bin/routest"),
 	}
-	rCmd := exec.CommandContext(ctx, cl[0], cl[1:]...)
-	rCmd.Stdout, rCmd.Stderr = os.Stdout, os.Stderr
-	defer func() {
-		_ = rCmd.Process.Kill()
-	}()
+	args := []string{"-i", "lo", "-c", cfg.configFile, "-q", strconv.FormatInt(NfQueueNum, 10)}
+	if err := routest.Start(needSudo, args...); err != nil {
+		log.Panicf("Failed to start routest: %v", err)
+	}
 	go func() {
-		if err := rCmd.Run(); err != nil {
-			log.Printf("Error returned from command %+v: %v", rCmd, err)
+		if err := routest.Wait(); err != nil {
+			log.Panicf("routest failed: %v", err)
 		}
 	}()
-	// wait a second to give routest time to start
+	// give it a moment to start
 	// TODO do something better than waiting
 	time.Sleep(time.Second)
 
@@ -120,7 +225,7 @@ func runWithConfig(cfg testConfig) ([]byte, []byte, error) {
 	errCh := make(chan error, 1)
 
 	traceFile := "trace.json"
-	cl = []string{}
+	cl := []string{}
 	if needSudo {
 		cl = append([]string{"sudo"}, cl...)
 	}
@@ -145,10 +250,11 @@ func runWithConfig(cfg testConfig) ([]byte, []byte, error) {
 	}
 	cl = append(cl, "-o", traceFile)
 	cl = append(cl, cfg.target)
-	dCmd := exec.CommandContext(ctx, cl[0], cl[1:]...)
+	dCmd := exec.Command(cl[0], cl[1:]...)
 	var outWriter bytes.Buffer
 	dCmd.Stdout, dCmd.Stderr = &outWriter, os.Stderr
 	go func() {
+		log.Printf("Calling dublin-traceroute with: %v", dCmd)
 		errCh <- dCmd.Run()
 	}()
 	select {
@@ -201,12 +307,12 @@ func requireEqualResults(t *testing.T, got, want *results.Results) {
 	}
 }
 
-func TestGoogleDNSOnePath(t *testing.T) {
-	wantJSON, err := ioutil.ReadFile("test_data/want_8.8.8.8_one_path.json")
+func testCompareResults(t *testing.T, testName string, numPaths int) {
+	wantJSON, err := ioutil.ReadFile(fmt.Sprintf("test_data/want_%s.json", testName))
 	require.NoError(t, err)
 	c := testConfig{
-		configFile: "test_data/config_8.8.8.8_one_path.json",
-		paths:      &one,
+		configFile: fmt.Sprintf("test_data/config_%s.json", testName),
+		paths:      &numPaths,
 		target:     "8.8.8.8",
 	}
 	_, gotJSON, err := runWithConfig(c)
@@ -218,4 +324,12 @@ func TestGoogleDNSOnePath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, len(want.Flows), len(got.Flows))
 	requireEqualResults(t, &got, &want)
+}
+
+func TestGoogleDNSOnePath(t *testing.T) {
+	testCompareResults(t, "8.8.8.8_one_path", 1)
+}
+
+func TestGoogleDNSTwoPaths(t *testing.T) {
+	testCompareResults(t, "8.8.8.8_two_paths", 2)
 }
